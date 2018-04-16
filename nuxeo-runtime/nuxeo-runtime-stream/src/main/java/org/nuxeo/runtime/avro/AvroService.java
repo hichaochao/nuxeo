@@ -18,21 +18,33 @@
  */
 package org.nuxeo.runtime.avro;
 
-import org.nuxeo.common.xmap.annotation.XNode;
-import org.nuxeo.common.xmap.annotation.XObject;
+import org.apache.avro.Schema;
+import org.apache.avro.message.SchemaStore;
 
 /**
- * The Avro schema descriptor.
+ * This service allows to create a {@link AvroSchemaFactoryContext}.
  *
  * @since 10.2
  */
-@XObject("schema")
-public class AvroSchemaDescriptor {
+public interface AvroService extends SchemaStore {
 
-    @XNode("@name")
-    public String name;
+    /**
+     * Registers the schema into the SchemaStore.
+     *
+     * @param schema to be registered
+     */
+    void addSchema(Schema schema);
 
-    @XNode("@file")
-    public String file;
+    <D> Schema createSchema(D input);
+
+    String decodeName(String input);
+
+    String encodeName(String input);
+
+    Schema findByName(String name);
+
+    <D, M> D fromAvro(Schema schema, Class<D> clazz, M object);
+
+    <D, M> M toAvro(Schema schema, D input);
 
 }
