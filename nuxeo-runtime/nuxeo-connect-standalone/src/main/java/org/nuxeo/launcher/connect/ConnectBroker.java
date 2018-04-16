@@ -26,10 +26,14 @@ import java.io.Console;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -125,6 +129,8 @@ public class ConnectBroker {
 
     public static final String OPTION_ACCEPT_DEFAULT = "ask";
 
+    private final File nuxeoHome;
+
     public ConnectBroker(Environment env) throws IOException, PackageException {
         this.env = env;
         service = new StandaloneUpdateService(env);
@@ -134,6 +140,18 @@ public class ConnectBroker {
         targetPlatform = env.getProperty(Environment.DISTRIBUTION_NAME) + "-"
                 + env.getProperty(Environment.DISTRIBUTION_VERSION);
         distributionMPDir = env.getProperty(PARAM_MP_DIR, DISTRIBUTION_MP_DIR_DEFAULT);
+
+        File serverHome = env.getServerHome();
+        if (serverHome != null) {
+            nuxeoHome = serverHome.getAbsoluteFile();
+        } else {
+            File userDir = new File(System.getProperty("user.dir"));
+            if ("bin".equalsIgnoreCase(userDir.getName())) {
+                nuxeoHome = userDir.getParentFile().getAbsoluteFile();
+            } else {
+                nuxeoHome = userDir.getAbsoluteFile();
+            }
+        }
     }
 
     public String getCLID() throws NoCLID {
@@ -576,18 +594,61 @@ public class ConnectBroker {
      * Uninstall a list of packages. If the list contains a package name (versus an ID), only the considered as best
      * matching package is uninstalled.
      *
-     * @param packageIdsToRemove The list can contain package IDs and names
+     * @param packages The list can contain package IDs and names
      * @see #pkgUninstall(String)
      */
-    public boolean pkgUninstall(List<String> packageIdsToRemove) {
-        log.debug("Uninstalling: " + packageIdsToRemove);
-        for (String pkgId : packageIdsToRemove) {
-            if (pkgUninstall(pkgId) == null) {
-                log.error("Unable to uninstall " + pkgId);
+    public boolean pkgUninstall(List<String> packages) {
+        // Resume previous uninstallation
+        Path path = new File(nuxeoHome, "tmp/.nuxeoctl-mp-uninstall").toPath();
+        List<String> resumedPackages = readPendingPackages(path);
+        log.debug("Uninstalling: " + resumedPackages);
+        for (String pkg : resumedPackages) {
+            if (pkgUninstall(pkg) == null) {
+                log.error("Unable to uninstall " + pkg);
                 return false;
             }
         }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot delete file: " + path, e);
+        }
+
+        // Continue current uninstallation
+        log.debug("Uninstalling: " + packages);
+        for (Iterator<String> it = packages.iterator(); it.hasNext(); ) {
+            String pkg = it.next();
+            if (pkgUninstall(pkg) == null) {
+                log.error("Unable to uninstall " + pkg);
+                return false;
+            }
+            // save pending packages as a file before launcher's update
+            if (isLauncherChanged()) {
+                List<String> pending = new ArrayList<>();
+                it.forEachRemaining(pending::add);
+                persistPendingPackages(path, pending);
+            }
+        }
         return true;
+    }
+
+    /**
+     * Reads the pending packages from file system.
+     * <p>
+     * This can happen when launcher exits itself for update and left other packages in pending. The pending packages
+     * are stored in a file. By default, the filepath is "tmp/.nuxeoctl-${cmd}" under the Nuxeo Server folder, where
+     * variable <tt>cmd</tt> is command name.
+     *
+     * @param path the filepath where the pending packages are stored
+     * @return all pending packages, empty if any IO exception occurs.
+     * @see #persistPendingPackages(Path, List)
+     */
+    protected List<String> readPendingPackages(Path path) {
+        try {
+            return Files.readAllLines(path);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to read pending packages to uninstall from file " + path, e);
+        }
     }
 
     /**
@@ -597,7 +658,7 @@ public class ConnectBroker {
      * @return The uninstalled LocalPackage or null if failed
      */
     public LocalPackage pkgUninstall(String pkgId) {
-        if (env.getProperty(LAUNCHER_CHANGED_PROPERTY, "false").equals("true")) {
+        if (isLauncherChanged()) {
             System.exit(LAUNCHER_CHANGED_EXIT_CODE);
         }
         CommandInfo cmdInfo = cset.newCommandInfo(CommandInfo.CMD_UNINSTALL);
@@ -849,18 +910,66 @@ public class ConnectBroker {
      * matching package is installed.
      *
      * @since 6.0
-     * @param packageIdsToInstall The list can contain package IDs and names
+     * @param packages The list can contain package IDs and names
      * @param ignoreMissing If true, doesn't throw an exception on unknown packages
      * @see #pkgInstall(String, boolean)
      */
-    public boolean pkgInstall(List<String> packageIdsToInstall, boolean ignoreMissing) {
-        log.debug("Installing: " + packageIdsToInstall);
-        for (String pkgId : packageIdsToInstall) {
-            if (pkgInstall(pkgId, ignoreMissing) == null && !ignoreMissing) {
+    public boolean pkgInstall(List<String> packages, boolean ignoreMissing) {
+        // Resume previous installation
+        Path path = new File(nuxeoHome, "tmp/.nuxeoctl-mp-install").toPath();
+        List<String> resumedPackages = readPendingPackages(path);
+        log.debug("Installing: " + resumedPackages);
+        for (String pkg : resumedPackages) {
+            if (pkgInstall(pkg, ignoreMissing) == null && !ignoreMissing) {
                 return false;
             }
         }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot delete file: " + path, e);
+        }
+
+        // Continue current installation
+        log.debug("Installing: " + packages);
+        for (Iterator<String> it = packages.iterator(); it.hasNext(); ) {
+            String pkg = it.next();
+            if (pkgInstall(pkg, ignoreMissing) == null && !ignoreMissing) {
+                return false;
+            }
+            // save pending packages as a file before launcher's update
+            if (isLauncherChanged()) {
+                List<String> pending = new ArrayList<>();
+                it.forEachRemaining(pending::add);
+                persistPendingPackages(path, pending);
+            }
+        }
         return true;
+    }
+
+    /**
+     * Persists the pending package operation into file system. It's useful when Nuxeo launcher is about to exit.
+     * <p>
+     * The target path will be <strong>truncated</strong> before being written. The naming convention of the target file
+     * is:
+     *
+     * <pre>
+     * .nuxeoctl-${cmd}
+     * </pre>
+     *
+     * where <tt>cmd</tt> is the command name. For example, ".nuxeoctl-mp-install" for command "mp-install". Inside the
+     * target file, each line represents one pending package.
+     *
+     * @param path the target path to persist
+     * @param packages list of pending package name/id to persist
+     * @throws IllegalStateException if any exception occurs
+     */
+    protected void persistPendingPackages(Path path, List<String> packages) {
+        try {
+            Files.write(path, packages, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot write to file " + path, e);
+        }
     }
 
     /**
@@ -877,6 +986,10 @@ public class ConnectBroker {
         return pkgInstall(pkgId, false);
     }
 
+    protected boolean isLauncherChanged() {
+        return "true".equals(env.getProperty(LAUNCHER_CHANGED_PROPERTY));
+    }
+
     /**
      * Install a local package.
      *
@@ -887,7 +1000,7 @@ public class ConnectBroker {
      * @see #pkgInstall(List, boolean)
      */
     public LocalPackage pkgInstall(String pkgId, boolean ignoreMissing) {
-        if (env.getProperty(LAUNCHER_CHANGED_PROPERTY, "false").equals("true")) {
+        if (isLauncherChanged()) {
             System.exit(LAUNCHER_CHANGED_EXIT_CODE);
         }
         CommandInfo cmdInfo = cset.newCommandInfo(CommandInfo.CMD_INSTALL);
